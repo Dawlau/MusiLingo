@@ -1,6 +1,8 @@
 # This script is based on https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
 
 """ PyTorch LLaMA model."""
+from collections import Counter
+import json
 import math
 from typing import List, Optional, Tuple, Union
 
@@ -79,6 +81,9 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
         self.register_buffer("inv_freq", inv_freq)
+        # self.inv_freq = nn.Parameter(inv_freq, requires_grad=True)
+
+        # print("Inv freq: ", self.inv_freq)
 
         # Build here to make `torch.jit.trace` work.
         self.max_seq_len_cached = max_position_embeddings
@@ -161,6 +166,11 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+
+        # print("Params for rotary embedding: ")
+        # for name, param in self.rotary_emb.named_parameters():
+        #     print(name, param.shape, param.requires_grad)
+
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -694,13 +704,18 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+            
+            if self.class_weights is None:
+                loss_fct = CrossEntropyLoss()
+            else:
+                loss_fct = CrossEntropyLoss(weight=self.class_weights.to(shift_logits.device))
+            
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss = loss_fct(shift_logits, shift_labels.long())
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -712,7 +727,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-        )
+    )
 
     def prepare_inputs_for_generation(
         self, input_ids, query_embeds=None, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
@@ -745,6 +760,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             }
         )
         return model_inputs
+
 
     @staticmethod
     def _reorder_cache(past_key_values, beam_idx):

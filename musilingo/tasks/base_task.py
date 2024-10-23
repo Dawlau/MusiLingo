@@ -14,6 +14,7 @@ from musilingo.common.dist_utils import get_rank, get_world_size, is_main_proces
 from musilingo.common.logger import MetricLogger, SmoothedValue
 from musilingo.common.registry import registry
 from musilingo.datasets.data_utils import prepare_sample
+from omegaconf import OmegaConf
 
 
 class BaseTask:
@@ -28,6 +29,8 @@ class BaseTask:
 
     def build_model(self, cfg):
         model_config = cfg.model_cfg
+
+        model_config = OmegaConf.merge(model_config, cfg.datasets_cfg)
 
         model_cls = registry.get_model_class(model_config.arch)
         return model_cls.from_config(model_config)
@@ -69,7 +72,15 @@ class BaseTask:
         return loss
 
     def valid_step(self, model, samples):
-        raise NotImplementedError
+        logits = model(samples)["logits"] 
+
+        logits = torch.softmax(logits, dim=-1)
+        token_ids = torch.argmax(logits, dim=-1)
+
+        gt = samples["text_input"]
+        pred = model.llama_tokenizer.batch_decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+        return pred, gt
 
     def before_evaluation(self, model, dataset, **kwargs):
         model.before_evaluation(dataset=dataset, task_type=type(self))
@@ -80,11 +91,13 @@ class BaseTask:
     def inference_step(self):
         raise NotImplementedError
 
-    def evaluation(self, model, data_loader, cuda_enabled=True):
+    def evaluation(self, model, data_loader, output_dir, cur_epoch, cuda_enabled=True):
         metric_logger = MetricLogger(delimiter="  ")
         header = "Evaluation"
         # TODO make it configurable
         print_freq = 10
+
+        model.eval()
 
         results = []
 
@@ -196,6 +209,8 @@ class BaseTask:
             # In iter-based runner, we schedule the learning rate based on iterations.
             inner_epoch = start_iters // iters_per_epoch
             header = header + "; inner epoch [{}]".format(inner_epoch)
+
+        iters_per_epoch = len(data_loader)
 
         for i in metric_logger.log_every(range(iters_per_epoch), log_freq, header):
             # if using iter-based runner, we stop after iters_per_epoch iterations.

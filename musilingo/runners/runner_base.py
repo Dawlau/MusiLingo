@@ -348,7 +348,18 @@ class RunnerBase:
     def setup_output_dir(self):
         lib_root = Path(registry.get_path("library_root"))
 
-        output_dir = lib_root / self.config.run_cfg.output_dir / self.job_id
+        datasets_config = self.config.datasets_cfg.mtt
+        model_config = self.config.model_cfg
+
+        ckpt = None
+        try:
+            ckpt = self.config.model_cfg.ckpt
+        except:
+            pass
+
+        model_dir = f"arch_{model_config.arch}_genre_{datasets_config.genre}_unit_{datasets_config.unit_type}_topk_{datasets_config.top_k}_tfidf_{datasets_config.tf_idf}_other_genres_{datasets_config.pct_other_genres}_audio_first_{self.config.model_cfg.audio_first}_cer_{self.config.model_cfg.cer}_ckpt_{ckpt is not None}"
+
+        output_dir = lib_root / self.config.run_cfg.output_dir / model_dir
         result_dir = output_dir / "result"
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -372,39 +383,40 @@ class RunnerBase:
             self._load_checkpoint(self.resume_ckpt_path)
 
         for cur_epoch in range(self.start_epoch, self.max_epoch):
-            # training phase
+            # training phasemax_epoch
             if not self.evaluate_only:
                 logging.info("Start training")
                 train_stats = self.train_epoch(cur_epoch)
                 self.log_stats(split_name="train", stats=train_stats)
-
+            # self._save_checkpoint(cur_epoch, is_best=False)
             # evaluation phase
             if len(self.valid_splits) > 0:
                 for split_name in self.valid_splits:
                     logging.info("Evaluating on {}.".format(split_name))
 
-                    val_log = self.eval_epoch(
-                        split_name=split_name, cur_epoch=cur_epoch
+                    self.eval_epoch(
+                        split_name=split_name, cur_epoch=cur_epoch, output_dir=self.output_dir
                     )
-                    if val_log is not None:
-                        if is_main_process():
-                            assert (
-                                "agg_metrics" in val_log
-                            ), "No agg_metrics found in validation log."
+                    
+            #         if val_log is not None:
+            #             if is_main_process():
+            #                 assert (
+            #                     "agg_metrics" in val_log
+            #                 ), "No agg_metrics found in validation log."
 
-                            agg_metrics = val_log["agg_metrics"]
-                            if agg_metrics > best_agg_metric and split_name == "val":
-                                best_epoch, best_agg_metric = cur_epoch, agg_metrics
+            #                 agg_metrics = val_log["agg_metrics"]
+            #                 if agg_metrics > best_agg_metric and split_name == "valid":
+            #                     best_epoch, best_agg_metric = cur_epoch, agg_metrics
 
-                                self._save_checkpoint(cur_epoch, is_best=True)
+            #                     self._save_checkpoint(cur_epoch, is_best=True)
 
-                            val_log.update({"best_epoch": best_epoch})
-                            self.log_stats(val_log, split_name)
+            #                 val_log.update({"best_epoch": best_epoch})
+            #                 self.log_stats(val_log, split_name)
 
-            else:
-                # if no validation split is provided, we just save the checkpoint at the end of each epoch.
-                if not self.evaluate_only:
-                    self._save_checkpoint(cur_epoch, is_best=False)
+            # else:
+            #     # if no validation split is provided, we just save the checkpoint at the end of each epoch.
+            #     if not self.evaluate_only:
+                    
 
             if self.evaluate_only:
                 break
@@ -448,7 +460,7 @@ class RunnerBase:
         )
 
     @torch.no_grad()
-    def eval_epoch(self, split_name, cur_epoch, skip_reload=False):
+    def eval_epoch(self, split_name, cur_epoch, output_dir, skip_reload=False):
         """
         Evaluate the model on a given split.
 
@@ -473,7 +485,7 @@ class RunnerBase:
             model=model,
             dataset=self.datasets[split_name],
         )
-        results = self.task.evaluation(model, data_loader)
+        results = self.task.evaluation(model, data_loader, output_dir, cur_epoch, split_name)
 
         if results is not None:
             return self.task.after_evaluation(
@@ -519,6 +531,7 @@ class RunnerBase:
             else:
                 # map-style dataset are concatenated together
                 # setup distributed sampler
+
                 if self.use_distributed:
                     sampler = DistributedSampler(
                         dataset,
@@ -544,8 +557,9 @@ class RunnerBase:
                 )
                 loader = PrefetchLoader(loader)
 
-                if is_train:
-                    loader = IterLoader(loader, use_distributed=self.use_distributed)
+                # if is_train:
+                loader = IterLoader(loader, use_distributed=self.use_distributed)
+
 
             return loader
 
@@ -554,6 +568,7 @@ class RunnerBase:
         for dataset, bsz, is_train, collate_fn in zip(
             datasets, batch_sizes, is_trains, collate_fns
         ):
+            print(dataset)
             if isinstance(dataset, list) or isinstance(dataset, tuple):
                 if hasattr(dataset[0], 'sample_ratio') and dataset_ratios is None:
                     dataset_ratios = [d.sample_ratio for d in dataset]

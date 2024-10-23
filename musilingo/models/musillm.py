@@ -1,29 +1,67 @@
 from collections import Counter
 import json
-import logging
 import random
 
 import torch
-from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
+from torch.cuda.amp import autocast as autocast
+from math import sqrt
 
 from musilingo.common.registry import registry
 from musilingo.models.llama_model import LlamaForCausalLM
 from musilingo.models.base_model import BaseModel
 from transformers import LlamaTokenizer, Wav2Vec2FeatureExtractor, AutoModel
-from transformers import StoppingCriteria, StoppingCriteriaList
-
-import torchaudio.transforms as T
 
 
-@registry.register_model("musilingo")
-class MusiLingo(BaseModel):
+class ReprogrammingLayer(nn.Module):
+    def __init__(self, d_model, n_heads, d_keys=None, d_llm=None, attention_dropout=0.1):
+        super(ReprogrammingLayer, self).__init__()
+
+        d_keys = d_keys or (d_model // n_heads)
+
+        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.key_projection = nn.Linear(d_llm, d_keys * n_heads)
+        self.value_projection = nn.Linear(d_llm, d_keys * n_heads)
+        self.out_projection = nn.Linear(d_keys * n_heads, d_llm)
+        self.n_heads = n_heads
+        self.dropout = nn.Dropout(attention_dropout)
+
+    def forward(self, target_embedding, source_embedding, value_embedding):
+        B, L, _ = target_embedding.shape
+        S, _ = source_embedding.shape
+        H = self.n_heads
+
+        target_embedding = self.query_projection(target_embedding).view(B, L, H, -1)
+        source_embedding = self.key_projection(source_embedding).view(S, H, -1)
+        value_embedding = self.value_projection(value_embedding).view(S, H, -1)
+
+        out = self.reprogramming(target_embedding, source_embedding, value_embedding)
+
+        out = out.reshape(B, L, -1)
+
+        return self.out_projection(out)
+
+    def reprogramming(self, target_embedding, source_embedding, value_embedding):
+        B, L, H, E = target_embedding.shape
+
+        scale = 1. / sqrt(E)
+
+        scores = torch.einsum("blhe,she->bhls", target_embedding, source_embedding)
+
+        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+        reprogramming_embedding = torch.einsum("bhls,she->blhe", A, value_embedding)
+
+        return reprogramming_embedding
+
+
+@registry.register_model("musillm")
+class MusiLLM(BaseModel):
     """
     MERT GPT-LLAMA model.
     """
 
     PRETRAINED_MODEL_CONFIG_DICT = {
-        "pretrain_vicuna": "configs/models/musilingo.yaml",
+        "pretrain_vicuna": "configs/models/musillm.yaml",
     }
 
     def __init__(
@@ -56,6 +94,7 @@ class MusiLingo(BaseModel):
         self.unit_type = self.dataset_config.get("unit_type", "unigram")
 
         print('Loading Audio Encoder')
+        # Replace with custom encoder (MERT + reprogramming)
         self.audio_encoder = AutoModel.from_pretrained(mert_model, trust_remote_code=True)
         # loading the corresponding preprocessor config
         self.processor = Wav2Vec2FeatureExtractor.from_pretrained(mert_model, trust_remote_code=True)
@@ -82,37 +121,20 @@ class MusiLingo(BaseModel):
                 llama_model,
                 torch_dtype=torch.float16,
             )
-        # self.llama_model = self.llama_model.to("cuda")
-        # inputs = self.llama_tokenizer("###Human: Tell me a story ###Assistant: ", return_tensors="pt", padding=True, truncation=True).to(self.llama_model.device)
-    
-        # # Generate response from the model
-        # with torch.cuda.amp.autocast(enabled=True):
-            # outputs = self.llama_model.generate(
-        #         input_ids=inputs['input_ids'],
-        #         attention_mask=inputs['attention_mask'],
-        #         max_length=300,
-        #         do_sample=True,  # Enable sampling for diverse responses
-        #         top_k=50,  # Top-k sampling for more interesting output
-        #         top_p=0.95,  # Nucleus sampling
-        #         temperature=0.7  # Adjust temperature for creativity
-        #     )
 
-        # # Decode the generated response
-        # answer = self.llama_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # print(answer)
-        # exit(0)
-
-        self.llama_model.class_weights = None
-        if self.cer and self.genre != "all":
+        if self.genre != "all":
             with open(f"genres_vocab/{self.genre}_vocab_{self.unit_type}_tf_idf_{self.tf_idf}.json", "r") as f:
                 counts_vocabulary = json.load(f)
 
-            vocabulary = [(word, freq) for word, freq in Counter(counts_vocabulary).most_common(None if self.top_k == -1 else self.top_k)]
+                self.vocabulary = [word for word, _ in Counter(counts_vocabulary).most_common(None if self.top_k == -1 else self.top_k)]
+                self.vocabulary_freq = [(word, freq) for word, freq in Counter(counts_vocabulary).most_common(None if self.top_k == -1 else self.top_k)]
 
+        self.llama_model.class_weights = None
+        if self.cer and self.genre != "all":
             token_ids = dict()
             total_freq = 0
 
-            for word, freq in vocabulary:
+            for word, freq in self.vocabulary_freq:
                 tokens = self.llama_tokenizer(word, add_special_tokens=False, return_tensors="pt")["input_ids"].tolist()[0]
                 for token in tokens:
                     if token not in token_ids:
@@ -136,9 +158,23 @@ class MusiLingo(BaseModel):
             param.requires_grad = False
         print('Loading LLAMA Done')
 
+        self.vocabulary_embeddings = None
+
+        self.reprogramming_layer = ReprogrammingLayer(
+            self.audio_encoder.config.hidden_size,
+            8,
+            d_keys=128,
+            d_llm=self.llama_model.config.hidden_size,
+        )
+
+        self.audio_proj = nn.Linear(
+            self.llama_model.config.hidden_size, self.audio_encoder.config.hidden_size
+        )
+
         self.llama_proj = nn.Linear(
             self.audio_encoder.config.hidden_size, self.llama_model.config.hidden_size
         )
+
         self.max_txt_len = max_txt_len
         self.end_sym = end_sym
 
@@ -158,7 +194,7 @@ class MusiLingo(BaseModel):
         self.audio_encoder.to("cpu")
         self.audio_encoder.float()
 
-    def encode_audio(self, audio, attn=None):
+    def reprogram_audio(self, audio, attn=None):
         device = audio.device
         if self.low_resource:
             self.audioenc_to_cpu()
@@ -189,7 +225,24 @@ class MusiLingo(BaseModel):
         else:
           audio_embeds = avg_tmp
         audio_embeds = audio_embeds.to(device)
-        inputs_llama = self.llama_proj(audio_embeds)
+
+        if self.vocabulary_embeddings is None:
+            llama_input_embeddings = self.llama_model.get_input_embeddings().weight
+
+            if self.genre != "all":
+                token_ids = list()
+                for word in self.vocabulary:
+                    tokens = self.llama_tokenizer(word, add_special_tokens=False, return_tensors="pt")["input_ids"].tolist()[0]
+                    token_ids.extend(tokens)
+                token_ids = list(set(token_ids))
+                self.vocabulary_embeddings = llama_input_embeddings.index_select(0, torch.tensor(token_ids).to(device))
+            else:
+                self.vocabulary_embeddings = llama_input_embeddings
+            
+
+        enc_audio = self.reprogramming_layer(audio_embeds, self.vocabulary_embeddings, self.vocabulary_embeddings)
+
+        inputs_llama = self.llama_proj(self.audio_proj(enc_audio))
         atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(audio.device)
         return inputs_llama, atts_llama
 
@@ -214,35 +267,20 @@ class MusiLingo(BaseModel):
             batch_size = audio_embeds.shape[0]
             p_before = []
             p_after = []
-            p = []
 
             for i in range(batch_size):
                 p_b, p_a = prompt[i].split('<AudioHere>')
                 p_before.append(p_b)
                 p_after.append(p_a)
-            #     p.append(p_b + p_a)
-            #     p[i] = p[i].replace("<Audio></Audio>", "")
-
-            # print(p)
-
-            # p_tokens = self.llama_tokenizer(
-            #     p, return_tensors="pt", add_special_tokens=False, padding="longest").to(audio_embeds.device)
-            
-            # p_embeds = self.llama_model.model.embed_tokens(p_tokens.input_ids)
-            # p_atts = p_tokens.attention_mask
-
-            # return p_embeds, p_atts
   
             p_before_tokens = self.llama_tokenizer(
-                p_before, return_tensors="pt", padding='longest', add_special_tokens=True).to(audio_embeds.device)
+                p_before, return_tensors="pt", padding='longest', add_special_tokens=False).to(audio_embeds.device)
             p_after_tokens = self.llama_tokenizer(
                 p_after, return_tensors="pt", padding='longest', add_special_tokens=False).to(audio_embeds.device)
             p_before_embeds = self.llama_model.model.embed_tokens(p_before_tokens.input_ids)
             p_after_embeds = self.llama_model.model.embed_tokens(p_after_tokens.input_ids)
             wrapped_audio_embeds = torch.cat([p_before_embeds, audio_embeds, p_after_embeds], dim=1)
-            wrapped_audio_embeds = torch.cat([p_before_embeds, p_after_embeds], dim=1)
             wrapped_atts_audio = torch.cat([p_before_tokens.attention_mask, atts_audio, p_after_tokens.attention_mask], dim=1)
-            wrapped_atts_audio = torch.cat([p_before_tokens.attention_mask, p_after_tokens.attention_mask], dim=1)
             return wrapped_audio_embeds, wrapped_atts_audio
         else:
             return audio_embeds, atts_audio
@@ -251,7 +289,7 @@ class MusiLingo(BaseModel):
     def forward(self, samples):
         audio = samples["audio"]
         attn = samples["attention_mask"] if "attention_mask" in samples else None
-        audio_embeds, atts_audio = self.encode_audio(audio, attn)
+        audio_embeds, atts_audio = self.reprogram_audio(audio, attn)
 
         if 'instruction_input' in samples:  # instruction tuning dataset
             instruction_prompt = []
@@ -311,100 +349,6 @@ class MusiLingo(BaseModel):
         loss = outputs.loss
 
         return {"loss": loss, "logits": outputs.logits}
-    
-    def evaluate_step(self, samples):
-        class StoppingCriteriaSub(StoppingCriteria):
-            def __init__(self, stops=[], encounters=1):
-                super().__init__()
-                self.stops = stops
-            def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
-                for stop in self.stops:
-                    if torch.all((stop == input_ids[0][-len(stop):])).item():
-                        return True
-                return False
-
-        stopping = StoppingCriteriaList([StoppingCriteriaSub([torch.tensor([835]).cuda(),
-                                    torch.tensor([2277, 29937]).cuda()])])
-
-        audio = samples["audio"].cuda()
-        audio_embeds, atts_audio = self.encode_audio(audio)
-
-        if 'instruction_input' in samples:  # instruction dataset
-            #print('Instruction Batch')
-            instruction_prompt = []
-            for instruction in samples['instruction_input']:
-                if self.audio_first:
-                    prompt = '<Audio><AudioHere></Audio> ' + instruction
-                else:
-                    prompt = instruction + ' <Audio><AudioHere></Audio>'
-                instruction_prompt.append(self.prompt_template.format(prompt))
-
-            audio_embeds, atts_audio = self.instruction_prompt_wrap(audio_embeds, atts_audio, instruction_prompt)
-
-        self.llama_tokenizer.padding_side = "right"
-        batch_size = audio_embeds.shape[0]
-        bos = torch.ones([batch_size, 1],
-                        dtype=torch.long,
-                        device=torch.device('cuda')) * self.llama_tokenizer.bos_token_id
-        bos_embeds = self.llama_model.model.embed_tokens(bos)
-        atts_bos = atts_audio[:, :1]
-        inputs_embeds = torch.cat([bos_embeds, audio_embeds], dim=1)
-        inputs_atts = torch.cat([atts_bos, atts_audio], dim=1)
-        
-        outputs = self.llama_model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=inputs_atts,
-            max_new_tokens=300,
-            stopping_criteria=stopping,
-            num_beams=1,
-            do_sample=True,
-            min_length=1,
-            top_p=0.9,
-            repetition_penalty=1.0,
-            length_penalty=1,
-            temperature=0.1,
-        )
-
-        # for output in outputs:
-        #     output_token = output
-        #     # if output_token[0] == 0:  # the model might output a unknow token <unk> at the beginning. remove it
-        #     #     output_token = output_token[1:]
-        #     # if output_token[0] == 1:  # if there is a start token <s> at the beginning. remove it
-        #     #     output_token = output_token[1:]
-        #     output_text = self.llama_tokenizer.decode(output_token, add_special_tokens=False)
-        #     output_text = output_text.split('###')[0]  # remove the stop sign '###'
-        #     output_text = output_text.split('Assistant:')[-1].strip()
-
-        # for output in outputs:
-            # output_token = output
-            # if output_token[0] == 0:  # the model might output a unknow token <unk> at the beginning. remove it
-            #     output_token = output_token[1:]
-            # if output_token[0] == 1:  # if there is a start token <s> at the beginning. remove it
-            #     output_token = output_token[1:]
-        text = outputs[0]
-        if text[0] == 0:
-            text = text[1:]
-        if text[0] == 1:
-            text = text[1:]
-        output_text = self.llama_tokenizer.decode(text, add_special_tokens=False)
-            # output_text = output_text.split('###')[0]  # remove the stop sign '###'
-            # output_text = output_text.split('Assistant:')[-1].strip()
-        print("Output: ", output_text)
-
-        text = outputs[1]
-        if text[0] == 0:
-            text = text[1:]
-        if text[0] == 1:
-            text = text[1:]
-        output_text = self.llama_tokenizer.decode(text, add_special_tokens=False)
-            # output_text = output_text.split('###')[0]  # remove the stop sign '###'
-            # output_text = output_text.split('Assistant:')[-1].strip()
-        print("Output: ", output_text)
-
-        # exit(0)
-
-        return output_text
-
 
     @classmethod
     def from_config(cls, cfg):
@@ -449,12 +393,5 @@ class MusiLingo(BaseModel):
             print("Load MERT-LLM Checkpoint: {}".format(ckpt_path))
             ckpt = torch.load(ckpt_path, map_location="cpu")
             msg = model.load_state_dict(ckpt['model'], strict=False)
-
-            # print(ckpt["model"])
-
-            # for x in ckpt["model"]:
-            #     print(x)
-
-            # exit(0)
 
         return model

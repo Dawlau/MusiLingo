@@ -5,7 +5,7 @@ model:
   mert_model: 'm-a-p/MERT-v1-330M'
 
   # Vicuna
-  llama_model: '/path/to/7B_vicuna'
+  llama_model: 'lmsys/vicuna-7b-v1.5'
 
   # generation configs
   prompt: ""

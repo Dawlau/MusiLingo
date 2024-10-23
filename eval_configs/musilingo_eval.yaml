@@ -2,7 +2,7 @@ model:
   arch: musilingo
   model_type: pretrain_vicuna
   mert_model: 'm-a-p/MERT-v1-330M'
-  llama_model: '/path/to/7B_vicuna'
+  llama_model: 'lmsys/vicuna-7b-v1.5'
   ckpt: 'path/to/checkpoint'
   prompt_template: '###Human: {} ###Assistant: '
   end_sym: "###"

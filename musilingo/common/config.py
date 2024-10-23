@@ -109,6 +109,17 @@ class Config:
                 {"datasets": {dataset_name: config["datasets"][dataset_name]}},
             )
 
+        model = config.get("model", None)
+        model_config = OmegaConf.create(
+            {"datasets": {dataset_name: model}}
+        )
+
+        if model_config is not None:
+            dataset_config = OmegaConf.merge(
+                dataset_config,
+                model_config,
+            )
+
         return dataset_config
 
     def _convert_to_dot_list(self, opts):
@@ -154,7 +165,6 @@ class Config:
                 logging.info(self._convert_node_to_json(dataset_config))
             else:
                 logging.warning(f"No dataset named '{dataset}' in config. Skipping")
-
         logging.info(f"\n======  Model Attributes  ======")
         logging.info(self._convert_node_to_json(self.config.model))
 

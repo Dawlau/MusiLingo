@@ -1,0 +1,13 @@
+model:
+  arch: musillm
+
+  # audio encoder
+  mert_model: 'm-a-p/MERT-v1-330M'
+
+  # Vicuna
+  llama_model: 'lmsys/vicuna-7b-v1.5'
+
+  # generation configs
+  prompt: ""
+
+

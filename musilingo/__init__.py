@@ -28,4 +28,4 @@ registry.register_path("repo_root", repo_root)
 #registry.register_path("cache_root", cache_root)
 
 registry.register("MAX_INT", sys.maxsize)
-registry.register("SPLIT_NAMES", ["train", "val", "test"])
+registry.register("SPLIT_NAMES", ["train", "valid", "test"])

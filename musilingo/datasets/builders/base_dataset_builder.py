@@ -178,7 +178,7 @@ class BaseDatasetBuilder:
 
         datasets = dict()
         for split in ann_info.keys():
-            if split not in ["train", "val", "test"]:
+            if split not in ["train", "valid", "test"]:
                 continue
 
             is_train = split == "train"
@@ -230,7 +230,10 @@ class BaseDatasetBuilder:
 
 
 def load_dataset_config(cfg_path):
-    cfg = OmegaConf.load(cfg_path).datasets
+    dataset_cfg = OmegaConf.load(cfg_path).datasets
+    model_cfg = OmegaConf.load(cfg_path).model
+
     cfg = cfg[list(cfg.keys())[0]]
+    cfg = OmegaConf.merge(cfg, model_cfg)
 
     return cfg
